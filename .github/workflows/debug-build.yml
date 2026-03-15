@@ -2,18 +2,69 @@ name: Debug APK Build
 
 on:
   workflow_dispatch:
+  schedule:
+    # Check for new upstream releases every 6 hours
+    - cron: '0 */6 * * *'
 
 env:
   NDK_VERSION: '28.0.13004108'
+  UPSTREAM_REPO: 'signalapp/Signal-Android'
 
 jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      release_tag: ${{ steps.check.outputs.release_tag }}
+    steps:
+    - name: Check for new upstream release
+      id: check
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        # For manual trigger, always build
+        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+          echo "release_tag=manual" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        LATEST=$(gh api repos/${{ env.UPSTREAM_REPO }}/releases/latest --jq '.tag_name')
+        echo "Latest upstream release: $LATEST"
+
+        # Check if we already have a build for this tag
+        EXISTING=$(gh api repos/${{ github.repository }}/actions/artifacts \
+          --jq ".artifacts[] | select(.name == \"signal-debug-apk-${LATEST}\") | .name" \
+          2>/dev/null || true)
+
+        if [ -z "$EXISTING" ]; then
+          echo "New release $LATEST — building"
+          echo "should_build=true" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$LATEST" >> "$GITHUB_OUTPUT"
+        else
+          echo "Already built $LATEST — skipping"
+          echo "should_build=false" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$LATEST" >> "$GITHUB_OUTPUT"
+        fi
+
   build-debug:
-    runs-on: ubuntu-latest-8-cores
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
 
     steps:
+    - name: Sync upstream release
+      if: needs.check-upstream.outputs.release_tag != 'manual'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        TAG="${{ needs.check-upstream.outputs.release_tag }}"
+        gh repo sync ${{ github.repository }} --source ${{ env.UPSTREAM_REPO }} --branch main --force
+
     - uses: actions/checkout@v4
       with:
         submodules: true
+        ref: ${{ needs.check-upstream.outputs.release_tag != 'manual' && needs.check-upstream.outputs.release_tag || '' }}
 
     - name: Set up JDK 17
       uses: actions/setup-java@v4
@@ -31,6 +82,6 @@ jobs:
     - name: Upload APK
       uses: actions/upload-artifact@v4
       with:
-        name: signal-debug-apk
+        name: signal-debug-apk-${{ needs.check-upstream.outputs.release_tag }}
         path: app/build/outputs/apk/playProd/debug/*.apk
-        retention-days: 14
+        retention-days: 90
