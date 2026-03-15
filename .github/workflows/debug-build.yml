@@ -102,24 +102,22 @@ jobs:
         GH_TOKEN: ${{ github.token }}
         TAG: ${{ needs.check-upstream.outputs.release_tag }}
         BODY: ${{ needs.check-upstream.outputs.release_body }}
+        REPO: ${{ github.repository }}
       run: |
         # Delete existing release for this tag if re-running manually
-        gh release delete "${TAG}-debug" --yes 2>/dev/null || true
-        git tag -d "${TAG}-debug" 2>/dev/null || true
-        git push origin ":refs/tags/${TAG}-debug" 2>/dev/null || true
+        gh release delete "${TAG}-debug" --repo "$REPO" --yes 2>/dev/null || true
 
         gh release create "${TAG}-debug" \
+          --repo "$REPO" \
+          --target main \
           --title "Signal Debug ${TAG}" \
-          --notes "$(cat <<NOTES_EOF
-        **Debug build** of Signal Android ${TAG} with \`LINK_DEVICE_UX_ENABLED = true\`.
+          --notes "**Debug build** of Signal Android ${TAG} with \`LINK_DEVICE_UX_ENABLED = true\`.
 
         To link as a secondary phone: long-press the Signal logo on the welcome screen → Link → scan QR from your primary device.
 
         ---
 
-        ${BODY}
-        NOTES_EOF
-        )" \
+        ${BODY}" \
           app/build/outputs/apk/playProd/debug/*arm64*.apk \
           app/build/outputs/apk/playProd/debug/*armeabi*.apk \
           app/build/outputs/apk/playProd/debug/*x86_64*.apk \
