@@ -6,6 +6,9 @@ on:
     # Check for new upstream releases every 6 hours
     - cron: '0 */6 * * *'
 
+permissions:
+  contents: write
+
 env:
   NDK_VERSION: '28.0.13004108'
   UPSTREAM_REPO: 'signalapp/Signal-Android'
@@ -16,35 +19,31 @@ jobs:
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
       release_tag: ${{ steps.check.outputs.release_tag }}
+      release_body: ${{ steps.check.outputs.release_body }}
     steps:
     - name: Check for new upstream release
       id: check
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
-        # For manual trigger, always build
-        if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-          echo "should_build=true" >> "$GITHUB_OUTPUT"
-          echo "release_tag=manual" >> "$GITHUB_OUTPUT"
-          exit 0
-        fi
-
+        # For manual trigger, use current version from upstream
         LATEST=$(gh api repos/${{ env.UPSTREAM_REPO }}/releases/latest --jq '.tag_name')
+        BODY=$(gh api repos/${{ env.UPSTREAM_REPO }}/releases/latest --jq '.body')
         echo "Latest upstream release: $LATEST"
 
-        # Check if we already have a build for this tag
-        EXISTING=$(gh api repos/${{ github.repository }}/actions/artifacts \
-          --jq ".artifacts[] | select(.name == \"signal-debug-apk-${LATEST}\") | .name" \
-          2>/dev/null || true)
+        echo "release_tag=$LATEST" >> "$GITHUB_OUTPUT"
+        echo "release_body<<BODY_EOF" >> "$GITHUB_OUTPUT"
+        echo "$BODY" >> "$GITHUB_OUTPUT"
+        echo "BODY_EOF" >> "$GITHUB_OUTPUT"
 
-        if [ -z "$EXISTING" ]; then
-          echo "New release $LATEST — building"
+        # Check if we already have a release for this tag
+        EXISTING=$(gh api repos/${{ github.repository }}/releases/tags/${LATEST}-debug --jq '.tag_name' 2>/dev/null || true)
+
+        if [ -z "$EXISTING" ] || [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
           echo "should_build=true" >> "$GITHUB_OUTPUT"
-          echo "release_tag=$LATEST" >> "$GITHUB_OUTPUT"
         else
-          echo "Already built $LATEST — skipping"
+          echo "Already released ${LATEST}-debug — skipping"
           echo "should_build=false" >> "$GITHUB_OUTPUT"
-          echo "release_tag=$LATEST" >> "$GITHUB_OUTPUT"
         fi
 
   build-debug:
@@ -63,18 +62,16 @@ jobs:
         sudo swapon /swapfile
         echo "Swap enabled:" && swapon --show
 
-    - name: Sync upstream release
-      if: needs.check-upstream.outputs.release_tag != 'manual'
+    - name: Sync upstream
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
-        TAG="${{ needs.check-upstream.outputs.release_tag }}"
         gh repo sync ${{ github.repository }} --source ${{ env.UPSTREAM_REPO }} --branch main --force
 
     - uses: actions/checkout@v4
       with:
         submodules: true
-        ref: ${{ needs.check-upstream.outputs.release_tag != 'manual' && needs.check-upstream.outputs.release_tag || '' }}
+        ref: ${{ needs.check-upstream.outputs.release_tag }}
 
     - name: Set up JDK 17
       uses: actions/setup-java@v4
@@ -91,9 +88,37 @@ jobs:
         GRADLE_OPTS: '-Dorg.gradle.jvmargs=-Xmx4g -Dorg.gradle.workers.max=2'
       run: ./gradlew assemblePlayProdDebug -x lint -x test --no-daemon --max-workers=2
 
-    - name: Upload APK
-      uses: actions/upload-artifact@v4
-      with:
-        name: signal-debug-apk-${{ needs.check-upstream.outputs.release_tag }}
-        path: app/build/outputs/apk/playProd/debug/*.apk
-        retention-days: 90
+    - name: Get version from APK filename
+      id: version
+      run: |
+        APK=$(ls app/build/outputs/apk/playProd/debug/*arm64*.apk)
+        VERSION=$(echo "$APK" | grep -oP '\d+\.\d+\.\d+')
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+    - name: Create release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TAG: ${{ needs.check-upstream.outputs.release_tag }}
+        BODY: ${{ needs.check-upstream.outputs.release_body }}
+      run: |
+        # Delete existing release for this tag if re-running manually
+        gh release delete "${TAG}-debug" --yes 2>/dev/null || true
+        git tag -d "${TAG}-debug" 2>/dev/null || true
+        git push origin ":refs/tags/${TAG}-debug" 2>/dev/null || true
+
+        gh release create "${TAG}-debug" \
+          --title "Signal Debug ${TAG}" \
+          --notes "$(cat <<NOTES_EOF
+        **Debug build** of Signal Android ${TAG} with \`LINK_DEVICE_UX_ENABLED = true\`.
+
+        To link as a secondary phone: long-press the Signal logo on the welcome screen → Link → scan QR from your primary device.
+
+        ---
+
+        ${BODY}
+        NOTES_EOF
+        )" \
+          app/build/outputs/apk/playProd/debug/*arm64*.apk \
+          app/build/outputs/apk/playProd/debug/*armeabi*.apk \
+          app/build/outputs/apk/playProd/debug/*x86_64*.apk \
+          app/build/outputs/apk/playProd/debug/*x86-*.apk
